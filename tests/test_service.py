@@ -233,7 +233,9 @@ class IssueAndExtensionTests(ServiceTestCase):
         )
         rental = self.issue(reservation)
         self.assertEqual(RentalStatus.ACTIVE, rental.status)
-        self.assertEqual(ReservationStatus.CONVERTED, reservation.status)
+        stored = self.service.repository.get_reservation(reservation.id)
+        self.assertEqual(ReservationStatus.CONVERTED, stored.status)
+        self.assertEqual(ReservationStatus.PENDING, reservation.status)
         self.assertEqual(ToolStatus.RENTED, self.service.repository.get_tool("tool-001").status)
         self.assertEqual(1, len(self.service.repository.payments))
 
@@ -397,4 +399,3 @@ class StatisticsTests(ServiceTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

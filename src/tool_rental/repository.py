@@ -66,6 +66,26 @@ class InMemoryRepository:
     def add_payment(self, payment: Payment) -> Payment:
         return self._add(self.payments, payment, payment.id)
 
+    def replace_tool(self, tool: Tool) -> Tool:
+        self.get_tool(tool.id)
+        self.tools = {**self.tools, tool.id: tool}
+        return tool
+
+    def replace_customer(self, customer: Customer) -> Customer:
+        self.get_customer(customer.id)
+        self.customers = {**self.customers, customer.id: customer}
+        return customer
+
+    def replace_reservation(self, reservation: Reservation) -> Reservation:
+        self.get_reservation(reservation.id)
+        self.reservations = {**self.reservations, reservation.id: reservation}
+        return reservation
+
+    def replace_rental(self, rental: Rental) -> Rental:
+        self.get_rental(rental.id)
+        self.rentals = {**self.rentals, rental.id: rental}
+        return rental
+
     def get_category(self, entity_id: str) -> ToolCategory:
         return self._get(self.categories, entity_id, "Категория")
 

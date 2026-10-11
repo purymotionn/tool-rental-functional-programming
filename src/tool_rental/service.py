@@ -16,6 +16,17 @@ from .calculations import (
     requires_maintenance,
     summarize_return,
 )
+from .constructors import (
+    make_category,
+    make_customer,
+    make_damage_report,
+    make_maintenance_record,
+    make_payment,
+    make_rental,
+    make_rental_line,
+    make_reservation,
+    make_tool,
+)
 from .exceptions import (
     InsufficientDepositError,
     InvalidStateError,
@@ -40,6 +51,12 @@ from .models import (
     ToolStatus,
 )
 from .repository import InMemoryRepository
+from .transformations import (
+    change_customer_status,
+    change_reservation_status,
+    change_tool_status,
+    extend_rental_copy,
+)
 
 
 CENT = Decimal("0.01")
@@ -69,17 +86,16 @@ class RentalService:
         maintenance_interval_days: int = 90,
         max_rental_days: int = 30,
     ) -> ToolCategory:
-        category = ToolCategory(
-            id=category_id,
-            name=name,
-            description=description,
-            daily_rate=daily_rate,
-            deposit_rate=deposit_rate,
-            late_fee_multiplier=late_fee_multiplier,
-            maintenance_interval_days=maintenance_interval_days,
-            max_rental_days=max_rental_days,
+        category = make_category(
+            category_id,
+            name,
+            description,
+            daily_rate,
+            deposit_rate,
+            late_fee_multiplier,
+            maintenance_interval_days,
+            max_rental_days,
         )
-        category.validate()
         return self.repository.add_category(category)
 
     def register_tool(
@@ -97,15 +113,14 @@ class RentalService:
             for tool in self.repository.tools.values()
         ):
             raise ValidationError("Инвентарный номер уже используется")
-        tool = Tool(
-            id=tool_id,
-            inventory_number=inventory_number,
-            name=name,
-            category_id=category_id,
-            purchase_price=purchase_price,
-            purchased_on=purchased_on,
+        tool = make_tool(
+            tool_id,
+            inventory_number,
+            name,
+            category_id,
+            purchase_price,
+            purchased_on,
         )
-        tool.validate()
         return self.repository.add_tool(tool)
 
     def register_customer(
@@ -117,14 +132,13 @@ class RentalService:
     ) -> Customer:
         if any(customer.phone == phone for customer in self.repository.customers.values()):
             raise ValidationError("Клиент с таким телефоном уже зарегистрирован")
-        customer = Customer(
-            id=customer_id,
-            full_name=full_name,
-            phone=phone,
-            email=email,
-            registered_at=self.current_time,
+        customer = make_customer(
+            customer_id,
+            full_name,
+            phone,
+            email,
+            self.current_time,
         )
-        customer.validate()
         return self.repository.add_customer(customer)
 
     def block_customer(self, customer_id: str, reason: str) -> Customer:
@@ -136,18 +150,20 @@ class RentalService:
             for rental in self.repository.rentals.values()
         ):
             raise InvalidStateError("Нельзя заблокировать клиента с активной арендой")
-        customer.status = CustomerStatus.BLOCKED
-        customer.notes.append(f"Блокировка: {reason}")
-        return customer
+        updated = change_customer_status(
+            customer,
+            CustomerStatus.BLOCKED,
+            f"Блокировка: {reason}",
+        )
+        return self.repository.replace_customer(updated)
 
     def unblock_customer(self, customer_id: str, comment: str = "") -> Customer:
         customer = self.repository.get_customer(customer_id)
         if customer.status != CustomerStatus.BLOCKED:
             raise InvalidStateError("Клиент не заблокирован")
-        customer.status = CustomerStatus.ACTIVE
-        if comment:
-            customer.notes.append(f"Разблокировка: {comment}")
-        return customer
+        note = f"Разблокировка: {comment}" if comment else ""
+        updated = change_customer_status(customer, CustomerStatus.ACTIVE, note)
+        return self.repository.replace_customer(updated)
 
     def find_available_tools(
         self,
@@ -239,30 +255,34 @@ class RentalService:
             customer.completed_rentals,
         )
 
-        reservation = Reservation(
-            id=self._new_id("res"),
-            customer_id=customer_id,
-            tool_ids=list(tool_ids),
-            start_date=start_date,
-            end_date=end_date,
-            created_at=self.current_time,
-            estimated_price=quote.final_charge,
-            required_deposit=quote.required_deposit,
-            comment=comment,
+        reservation = make_reservation(
+            self._new_id("res"),
+            customer_id,
+            tool_ids,
+            start_date,
+            end_date,
+            self.current_time,
+            quote.final_charge,
+            quote.required_deposit,
+            comment,
         )
-        reservation.validate()
         return self.repository.add_reservation(reservation)
 
     def confirm_reservation(self, reservation_id: str) -> Reservation:
         reservation = self.repository.get_reservation(reservation_id)
         if reservation.status != ReservationStatus.PENDING:
             raise InvalidStateError("Подтвердить можно только ожидающую бронь")
-        reservation.status = ReservationStatus.CONFIRMED
+        updated = change_reservation_status(
+            reservation,
+            ReservationStatus.CONFIRMED,
+        )
         for tool_id in reservation.tool_ids:
             tool = self.repository.get_tool(tool_id)
             if reservation.start_date == self.current_date:
-                tool.status = ToolStatus.RESERVED
-        return reservation
+                self.repository.replace_tool(
+                    change_tool_status(tool, ToolStatus.RESERVED)
+                )
+        return self.repository.replace_reservation(updated)
 
     def cancel_reservation(self, reservation_id: str, reason: str) -> Reservation:
         reservation = self.repository.get_reservation(reservation_id)
@@ -271,13 +291,18 @@ class RentalService:
             ReservationStatus.CONFIRMED,
         }:
             raise InvalidStateError("Эту бронь уже нельзя отменить")
-        reservation.status = ReservationStatus.CANCELLED
-        reservation.comment = f"{reservation.comment}\nОтмена: {reason}".strip()
+        updated = change_reservation_status(
+            reservation,
+            ReservationStatus.CANCELLED,
+            f"Отмена: {reason}",
+        )
         for tool_id in reservation.tool_ids:
             tool = self.repository.get_tool(tool_id)
             if tool.status == ToolStatus.RESERVED:
-                tool.status = ToolStatus.AVAILABLE
-        return reservation
+                self.repository.replace_tool(
+                    change_tool_status(tool, ToolStatus.AVAILABLE)
+                )
+        return self.repository.replace_reservation(updated)
 
     def expire_reservations(self) -> list[Reservation]:
         expired: list[Reservation] = []
@@ -326,38 +351,39 @@ class RentalService:
             tool.status = ToolStatus.RENTED
             line_deposit = tool.purchase_price * category.deposit_rate
             lines.append(
-                RentalLine(
-                    tool_id=tool.id,
-                    daily_rate=category.daily_rate,
-                    deposit=line_deposit.quantize(CENT, ROUND_HALF_UP),
-                    issued_condition=tool.condition_score,
+                make_rental_line(
+                    tool.id,
+                    category.daily_rate,
+                    line_deposit.quantize(CENT, ROUND_HALF_UP),
+                    tool.condition_score,
                 )
             )
             raw_price += category.daily_rate * reservation.rental_days
         if raw_price > 0:
             discount = Decimal("1") - reservation.estimated_price / raw_price
 
-        rental = Rental(
-            id=self._new_id("rent"),
-            customer_id=customer.id,
-            lines=lines,
-            start_date=reservation.start_date,
-            due_date=reservation.end_date,
-            issued_at=self.current_time,
-            discount_rate=discount.quantize(Decimal("0.0001")),
-            deposit_paid=deposit_paid,
-            base_charge=reservation.estimated_price,
+        rental = make_rental(
+            self._new_id("rent"),
+            customer.id,
+            lines,
+            reservation.start_date,
+            reservation.end_date,
+            self.current_time,
+            discount.quantize(Decimal("0.0001")),
+            deposit_paid,
+            reservation.estimated_price,
         )
-        rental.validate()
         self.repository.add_rental(rental)
-        reservation.status = ReservationStatus.CONVERTED
+        self.repository.replace_reservation(
+            change_reservation_status(reservation, ReservationStatus.CONVERTED)
+        )
         self.repository.add_payment(
-            Payment(
-                id=self._new_id("pay"),
-                rental_id=rental.id,
-                amount=deposit_paid,
-                kind="deposit",
-                created_at=self.current_time,
+            make_payment(
+                self._new_id("pay"),
+                rental.id,
+                deposit_paid,
+                "deposit",
+                self.current_time,
             )
         )
         return rental
@@ -384,14 +410,14 @@ class RentalService:
                 continue
             if rental.due_date < reservation.start_date <= new_due_date:
                 raise ToolUnavailableError("Инструмент забронирован другим клиентом")
-        rental.due_date = new_due_date
-        rental.base_charge = calculate_extended_charge(
+        new_charge = calculate_extended_charge(
             (line.daily_rate for line in rental.lines),
             rental.start_date,
             new_due_date,
             rental.discount_rate,
         )
-        return rental
+        updated = extend_rental_copy(rental, new_due_date, new_charge)
+        return self.repository.replace_rental(updated)
 
     def mark_overdue_rentals(self) -> list[Rental]:
         overdue: list[Rental] = []
@@ -434,14 +460,14 @@ class RentalService:
             line.returned_condition = returned_condition
             line.damage_charge = result.damage_charge
             if result.severity is not None:
-                damage = DamageReport(
-                    id=self._new_id("damage"),
-                    rental_id=rental.id,
-                    tool_id=tool.id,
-                    severity=result.severity,
-                    description=f"Состояние снизилось на {result.condition_loss} пунктов",
-                    estimated_repair_cost=result.damage_charge,
-                    reported_at=self.current_time,
+                damage = make_damage_report(
+                    self._new_id("damage"),
+                    rental.id,
+                    tool.id,
+                    result.severity,
+                    result.condition_loss,
+                    result.damage_charge,
+                    self.current_time,
                 )
                 self.repository.add_damage(damage)
                 tool.status = (
@@ -469,22 +495,22 @@ class RentalService:
             customer.overdue_returns += 1
         if rental.final_charge > 0:
             self.repository.add_payment(
-                Payment(
-                    id=self._new_id("pay"),
-                    rental_id=rental.id,
-                    amount=rental.final_charge,
-                    kind="charge",
-                    created_at=self.current_time,
+                make_payment(
+                    self._new_id("pay"),
+                    rental.id,
+                    rental.final_charge,
+                    "charge",
+                    self.current_time,
                 )
             )
         if rental.deposit_refund > 0:
             self.repository.add_payment(
-                Payment(
-                    id=self._new_id("pay"),
-                    rental_id=rental.id,
-                    amount=rental.deposit_refund,
-                    kind="refund",
-                    created_at=self.current_time,
+                make_payment(
+                    self._new_id("pay"),
+                    rental.id,
+                    rental.deposit_refund,
+                    "refund",
+                    self.current_time,
                 )
             )
         return rental
@@ -498,13 +524,12 @@ class RentalService:
         tool = self.repository.get_tool(tool_id)
         if tool.status in {ToolStatus.RENTED, ToolStatus.RETIRED}:
             raise InvalidStateError("Инструмент нельзя отправить на обслуживание")
-        record = MaintenanceRecord(
-            id=self._new_id("mnt"),
-            tool_id=tool_id,
-            reason=reason,
-            planned_on=planned_on,
+        record = make_maintenance_record(
+            self._new_id("mnt"),
+            tool_id,
+            reason,
+            planned_on,
         )
-        record.validate()
         return self.repository.add_maintenance(record)
 
     def start_maintenance(self, record_id: str) -> MaintenanceRecord:
