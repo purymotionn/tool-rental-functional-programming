@@ -4,6 +4,18 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import uuid4
 
+from .calculations import (
+    ReturnLineInput,
+    ToolPricingInput,
+    calculate_extended_charge,
+    calculate_rental_quote,
+    calculate_return_line,
+    most_popular_key,
+    overdue_days,
+    periods_overlap,
+    requires_maintenance,
+    summarize_return,
+)
 from .exceptions import (
     InsufficientDepositError,
     InvalidStateError,
@@ -160,7 +172,12 @@ class RentalService:
                     ReservationStatus.CONFIRMED,
                 }:
                     continue
-                if start_date <= reservation.end_date and end_date >= reservation.start_date:
+                if periods_overlap(
+                    start_date,
+                    end_date,
+                    reservation.start_date,
+                    reservation.end_date,
+                ):
                     occupied = True
                     break
             if occupied:
@@ -170,7 +187,12 @@ class RentalService:
                     continue
                 if not any(line.tool_id == tool.id for line in rental.lines):
                     continue
-                if start_date <= rental.due_date and end_date >= rental.start_date:
+                if periods_overlap(
+                    start_date,
+                    end_date,
+                    rental.start_date,
+                    rental.due_date,
+                ):
                     occupied = True
                     break
             if not occupied:
@@ -192,40 +214,30 @@ class RentalService:
             raise ValidationError("Нельзя оформить бронь в прошлом")
         if not tool_ids or len(set(tool_ids)) != len(tool_ids):
             raise ValidationError("Список инструментов пуст или содержит повторы")
-        days = (end_date - start_date).days + 1
-        if days <= 0:
-            raise ValidationError("Некорректный срок аренды")
-
         available_ids = {
             tool.id for tool in self.find_available_tools(start_date, end_date)
         }
-        price = Decimal("0")
-        deposit = Decimal("0")
+        pricing_items: list[ToolPricingInput] = []
         for tool_id in tool_ids:
             tool = self.repository.get_tool(tool_id)
             category = self.repository.get_category(tool.category_id)
             if tool_id not in available_ids:
                 raise ToolUnavailableError(f"Инструмент {tool_id} недоступен")
-            if days > category.max_rental_days:
-                raise ValidationError(
-                    f"Для категории {category.name} разрешено не более "
-                    f"{category.max_rental_days} дней"
+            pricing_items.append(
+                ToolPricingInput(
+                    tool_id=tool.id,
+                    daily_rate=category.daily_rate,
+                    purchase_price=tool.purchase_price,
+                    deposit_rate=category.deposit_rate,
+                    max_rental_days=category.max_rental_days,
                 )
-            price += category.daily_rate * days
-            deposit += tool.purchase_price * category.deposit_rate
-
-        discount = Decimal("0")
-        if customer.completed_rentals >= 10:
-            discount = Decimal("0.10")
-        elif customer.completed_rentals >= 5:
-            discount = Decimal("0.05")
-        if days >= 14:
-            discount += Decimal("0.07")
-        elif days >= 7:
-            discount += Decimal("0.03")
-        discount = min(discount, Decimal("0.20"))
-        price = (price * (Decimal("1") - discount)).quantize(CENT, ROUND_HALF_UP)
-        deposit = deposit.quantize(CENT, ROUND_HALF_UP)
+            )
+        quote = calculate_rental_quote(
+            pricing_items,
+            start_date,
+            end_date,
+            customer.completed_rentals,
+        )
 
         reservation = Reservation(
             id=self._new_id("res"),
@@ -234,8 +246,8 @@ class RentalService:
             start_date=start_date,
             end_date=end_date,
             created_at=self.current_time,
-            estimated_price=price,
-            required_deposit=deposit,
+            estimated_price=quote.final_charge,
+            required_deposit=quote.required_deposit,
             comment=comment,
         )
         reservation.validate()
@@ -373,10 +385,12 @@ class RentalService:
             if rental.due_date < reservation.start_date <= new_due_date:
                 raise ToolUnavailableError("Инструмент забронирован другим клиентом")
         rental.due_date = new_due_date
-        base = sum(line.daily_rate * total_days for line in rental.lines)
-        rental.base_charge = (
-            base * (Decimal("1") - rental.discount_rate)
-        ).quantize(CENT, ROUND_HALF_UP)
+        rental.base_charge = calculate_extended_charge(
+            (line.daily_rate for line in rental.lines),
+            rental.start_date,
+            new_due_date,
+            rental.discount_rate,
+        )
         return rental
 
     def mark_overdue_rentals(self) -> list[Rental]:
@@ -399,47 +413,40 @@ class RentalService:
         if set(returned_conditions) != expected_ids:
             raise ValidationError("Необходимо указать состояние каждого инструмента")
 
-        late_charge = Decimal("0")
-        overdue_days = max(0, (self.current_date - rental.due_date).days)
-        damage_charge = Decimal("0")
+        days_overdue = overdue_days(rental.due_date, self.current_date)
+        line_results = []
         for line in rental.lines:
             returned_condition = returned_conditions[line.tool_id]
-            if not 0 <= returned_condition <= 100:
-                raise ValidationError("Состояние должно находиться между 0 и 100")
             tool = self.repository.get_tool(line.tool_id)
             category = self.repository.get_category(tool.category_id)
+            result = calculate_return_line(
+                ReturnLineInput(
+                    tool_id=tool.id,
+                    daily_rate=line.daily_rate,
+                    late_fee_multiplier=category.late_fee_multiplier,
+                    purchase_price=tool.purchase_price,
+                    issued_condition=line.issued_condition,
+                    returned_condition=returned_condition,
+                ),
+                days_overdue,
+            )
+            line_results.append(result)
             line.returned_condition = returned_condition
-            if overdue_days:
-                late_charge += line.daily_rate * overdue_days * category.late_fee_multiplier
-            condition_loss = line.issued_condition - returned_condition
-            if condition_loss > 0:
-                if condition_loss >= 50:
-                    severity = DamageSeverity.IRREPARABLE
-                    line.damage_charge = tool.purchase_price
-                elif condition_loss >= 25:
-                    severity = DamageSeverity.MAJOR
-                    line.damage_charge = tool.purchase_price * Decimal("0.40")
-                elif condition_loss >= 10:
-                    severity = DamageSeverity.MINOR
-                    line.damage_charge = tool.purchase_price * Decimal("0.15")
-                else:
-                    severity = DamageSeverity.COSMETIC
-                    line.damage_charge = tool.purchase_price * Decimal("0.03")
-                line.damage_charge = line.damage_charge.quantize(CENT, ROUND_HALF_UP)
+            line.damage_charge = result.damage_charge
+            if result.severity is not None:
                 damage = DamageReport(
                     id=self._new_id("damage"),
                     rental_id=rental.id,
                     tool_id=tool.id,
-                    severity=severity,
-                    description=f"Состояние снизилось на {condition_loss} пунктов",
-                    estimated_repair_cost=line.damage_charge,
+                    severity=result.severity,
+                    description=f"Состояние снизилось на {result.condition_loss} пунктов",
+                    estimated_repair_cost=result.damage_charge,
                     reported_at=self.current_time,
                 )
                 self.repository.add_damage(damage)
-                damage_charge += line.damage_charge
                 tool.status = (
                     ToolStatus.RETIRED
-                    if severity == DamageSeverity.IRREPARABLE
+                    if result.severity == DamageSeverity.IRREPARABLE
                     else ToolStatus.MAINTENANCE
                 )
             else:
@@ -447,21 +454,18 @@ class RentalService:
             tool.condition_score = returned_condition
             tool.total_rental_days += (self.current_date - rental.start_date).days + 1
 
-        rental.late_charge = late_charge.quantize(CENT, ROUND_HALF_UP)
-        rental.damage_charge = damage_charge.quantize(CENT, ROUND_HALF_UP)
-        rental.final_charge = (
-            rental.base_charge + rental.late_charge + rental.damage_charge
-        ).quantize(CENT, ROUND_HALF_UP)
-        rental.deposit_refund = max(
-            Decimal("0"), rental.deposit_paid - rental.final_charge
-        ).quantize(CENT, ROUND_HALF_UP)
+        summary = summarize_return(rental.base_charge, rental.deposit_paid, line_results)
+        rental.late_charge = summary.late_charge
+        rental.damage_charge = summary.damage_charge
+        rental.final_charge = summary.final_charge
+        rental.deposit_refund = summary.deposit_refund
         rental.returned_at = self.current_time
         rental.status = RentalStatus.COMPLETED
 
         customer = self.repository.get_customer(rental.customer_id)
         customer.completed_rentals += 1
         customer.total_spent += rental.final_charge
-        if overdue_days:
+        if days_overdue:
             customer.overdue_returns += 1
         if rental.final_charge > 0:
             self.repository.add_payment(
@@ -548,8 +552,12 @@ class RentalService:
                 continue
             category = self.repository.get_category(tool.category_id)
             reference = tool.last_maintenance_on or tool.purchased_on
-            elapsed = (self.current_date - reference).days
-            if elapsed >= category.maintenance_interval_days or tool.condition_score < 70:
+            if requires_maintenance(
+                reference,
+                self.current_date,
+                category.maintenance_interval_days,
+                tool.condition_score,
+            ):
                 result.append(tool)
         return result
 
@@ -568,9 +576,7 @@ class RentalService:
             for line in rental.lines:
                 tool = self.repository.get_tool(line.tool_id)
                 category_days[tool.category_id] = category_days.get(tool.category_id, 0) + days
-        popular_category = (
-            max(category_days, key=category_days.get) if category_days else None
-        )
+        popular_category = most_popular_key(category_days)
         return {
             "completed_rentals": len(completed),
             "active_rentals": sum(
